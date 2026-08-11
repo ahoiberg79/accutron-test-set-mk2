@@ -1,0 +1,848 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <Adafruit_ADS1X15.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_ADS1115 ads;
+
+// ============================================================
+// Rev B PCB ADS1115 channel map
+// ============================================================
+// A0 = RUN terminal sense / SENSE_LO through R3 4.7k from PHASE/J1
+// A1 = SENSE_HI, high side of R2 current sense resistor
+// A2 = unused / spare
+// A3 = COIL_TEST / COIL/J3
+const uint8_t CH_SENSE_LO_RUN = 0;
+const uint8_t CH_SENSE_HI     = 1;
+const uint8_t CH_UNUSED_A2    = 2;
+const uint8_t CH_COIL         = 3;
+
+// ============================================================
+// Arduino digital inputs
+// ============================================================
+// All use INPUT_PULLUP.
+// Switch pulls selected input to GND.
+const uint8_t PIN_COIL_DETECT = 2;  // LOW = COIL TEST mode selected
+const uint8_t PIN_RUN_DETECT  = 3;  // LOW = PHASING mode selected
+const uint8_t PIN_COIL_ENABLE = 4;  // LOW = COIL ENABLE rocker ON
+
+enum TesterMode {
+  MODE_STOP,
+  MODE_RUN,
+  MODE_COIL
+};
+
+// ============================================================
+// Board calibration constants
+// ============================================================
+// Fill these in if you want board-specific calibration:
+//
+// R2 measured current-sense resistor: ______ ohms
+// R5 measured coil-test resistor:    ______ ohms
+// REF_2V5 measured voltage:          ______ V
+//
+// For first test build using R2 1%, leave 1000.0 or enter measured value.
+// Later with R2 0.1%, 1000.0 is fine unless you want exact calibration.
+
+const float senseResistor_ohms = 1000.0;       // R2
+const float coilKnownResistor_ohms = 47000.0;  // R5
+const float outputPulldown_ohms = 4700000.0;   // R6, PHASE/RUN+ to GND
+const float coilPulldown_ohms = 10000000.0;    // R7, COIL+ to GND
+const float referenceVoltage_V = 2.500;        // LM4040 nominal reference
+
+// ADS1115 GAIN_ONE:
+// +/-4.096V full scale = 0.125mV/count
+const float ADS_VOLTS_PER_COUNT = 0.000125;
+
+// ============================================================
+// Current filtering / display behavior
+// ============================================================
+const int currentBlockSamples = 8;
+const int currentBufferSize = 10;
+
+float currentBuffer[currentBufferSize];
+int currentBufferIndex = 0;
+int currentBufferCount = 0;
+
+const float currentDisplaySmoothing = 0.08;
+float displayedCurrent_uA = 0.0;
+float filteredCurrent_uA = 0.0;
+
+const float zeroDeadband_uA = 0.35;
+
+const float currentJumpThreshold_uA = 5.0;
+const int requiredJumpPersistence = 3;
+int jumpPersistenceCounter = 0;
+float pendingJumpCurrent_uA = 0.0;
+
+const float highCurrentThreshold_uA = 12.0;
+const int highCurrentPersistenceBlocks = 4;
+int highCurrentCounter = 0;
+bool highCurrentFlag = false;
+
+// Voltage/current reacquisition behavior
+const float voltageMoveThreshold = 0.015;
+const unsigned long currentReacquire_ms = 350;
+const float outputOffThreshold_V = 0.10;
+
+float stableVoltageReference = 0.0;
+bool voltageMovementSuspected = false;
+unsigned long lastVoltageMove_ms = 0;
+bool currentDisplayValid = false;
+
+// ============================================================
+// Coil-test thresholds
+// ============================================================
+const float coilShortThreshold_ohms = 100.0;
+const float coilOpenVoltageThreshold_V = 2.40;
+const float coilHighDisplayLimit_ohms = 50000.0;
+
+// ============================================================
+// Function declarations
+// ============================================================
+TesterMode readMode();
+bool coilEnableOn();
+
+float readSingleEndedVoltage(uint8_t channel, int samples);
+float readRunTerminalVoltage();
+float readCoilVoltage();
+float readCurrentBlock_uA();
+
+float calculateOutputPulldownCurrent_uA(float terminalVoltage);
+float applyOutputPulldownCorrection(float measuredCurrent_uA, float terminalVoltage);
+
+float calculateCoilResistance_ohms(float coilVoltage);
+
+void resetCurrentFilter(float seedCurrent_uA);
+void clearCurrentFilter();
+float averageCurrentBuffer();
+float processCurrentForDisplay(float rawCurrent_uA);
+void updateHighCurrentFlag(float rawCurrent_uA);
+
+void drawBootScreen();
+void drawRunDisplay(float terminalVoltage, float current_uA, bool showCurrent);
+void drawStopDisplay(bool coilEnableIsOn);
+void drawCoilDisplay(float coilVoltage, float coilResistance_ohms, bool enableOn);
+void drawCoilEnableWarningDisplay();
+
+void printRunDebug(
+  float terminalVoltage,
+  float measuredCurrent_uA,
+  float correctedCurrent_uA,
+  float filteredCurrent_uA,
+  bool showCurrent
+);
+
+void printCoilDebug(float coilVoltage, float coilResistance_ohms, bool enableOn);
+
+// ============================================================
+// Setup
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  pinMode(PIN_COIL_DETECT, INPUT_PULLUP);
+  pinMode(PIN_RUN_DETECT, INPUT_PULLUP);
+  pinMode(PIN_COIL_ENABLE, INPUT_PULLUP);
+
+  if (!ads.begin(0x48)) {
+    Serial.println(F("CRITICAL ERROR: ADS1115 not found at 0x48"));
+    while (1);
+  }
+
+  ads.setGain(GAIN_ONE);
+
+  if (!display.begin(0x3C, true)) {
+    Serial.println(F("CRITICAL ERROR: OLED allocation/init failed"));
+    while (1);
+  }
+
+  drawBootScreen();
+
+  Serial.println(F("Accutron Tester Rev B PCB"));
+  Serial.println(F("ADS A0 = PHASE terminal / SENSE_LO"));
+  Serial.println(F("ADS A1 = SENSE_HI"));
+  Serial.println(F("ADS A2 = unused"));
+  Serial.println(F("ADS A3 = COIL_TEST"));
+  Serial.println(F("D2 = COIL_DETECT"));
+  Serial.println(F("D3 = RUN_DETECT"));
+  Serial.println(F("D4 = COIL_ENABLE"));
+
+  delay(3500);
+
+  stableVoltageReference = 0.0;
+  lastVoltageMove_ms = millis();
+
+  display.clearDisplay();
+  display.display();
+}
+
+// ============================================================
+// Main loop
+// ============================================================
+void loop() {
+  TesterMode mode = readMode();
+
+  // ----------------------------------------------------------
+  // PHASING / RUN mode
+  // ----------------------------------------------------------
+  if (mode == MODE_RUN) {
+
+    // Safety lockout:
+    // Do not allow normal PHASING screen while COIL ENABLE is ON.
+    if (coilEnableOn()) {
+      currentDisplayValid = false;
+      clearCurrentFilter();
+      voltageMovementSuspected = false;
+      stableVoltageReference = 0.0;
+      lastVoltageMove_ms = millis();
+
+      drawCoilEnableWarningDisplay();
+
+      static unsigned long lastLockoutPrint_ms = 0;
+      if (millis() - lastLockoutPrint_ms >= 500) {
+        lastLockoutPrint_ms = millis();
+        Serial.println(F("RUN LOCKOUT: COIL ENABLE switch is ON"));
+      }
+
+      delay(100);
+      return;
+    }
+
+    float terminalVoltage = readRunTerminalVoltage();
+
+    bool outputOff = terminalVoltage < outputOffThreshold_V;
+
+    if (outputOff) {
+      lastVoltageMove_ms = millis();
+      currentDisplayValid = false;
+      clearCurrentFilter();
+      stableVoltageReference = terminalVoltage;
+      voltageMovementSuspected = false;
+    } else {
+      float voltageChangeFromStable = fabs(terminalVoltage - stableVoltageReference);
+
+      if (voltageChangeFromStable > voltageMoveThreshold) {
+        voltageMovementSuspected = true;
+        lastVoltageMove_ms = millis();
+        currentDisplayValid = false;
+        clearCurrentFilter();
+        stableVoltageReference = terminalVoltage;
+      } else {
+        voltageMovementSuspected = false;
+        stableVoltageReference =
+          (stableVoltageReference * 0.95) + (terminalVoltage * 0.05);
+      }
+    }
+
+    float measuredCurrent_uA = readCurrentBlock_uA();
+    float correctedCurrent_uA =
+      applyOutputPulldownCorrection(measuredCurrent_uA, terminalVoltage);
+
+    bool voltageRecentlyMoved =
+      (millis() - lastVoltageMove_ms) < currentReacquire_ms;
+
+    bool showCurrent =
+      !voltageRecentlyMoved &&
+      !outputOff &&
+      !voltageMovementSuspected;
+
+    if (!showCurrent) {
+      currentDisplayValid = false;
+      clearCurrentFilter();
+    } else {
+      if (!currentDisplayValid) {
+        resetCurrentFilter(correctedCurrent_uA);
+        displayedCurrent_uA = correctedCurrent_uA;
+        filteredCurrent_uA = correctedCurrent_uA;
+        currentDisplayValid = true;
+      } else {
+        filteredCurrent_uA = processCurrentForDisplay(correctedCurrent_uA);
+        displayedCurrent_uA =
+          (displayedCurrent_uA * (1.0 - currentDisplaySmoothing)) +
+          (filteredCurrent_uA * currentDisplaySmoothing);
+      }
+
+      updateHighCurrentFlag(correctedCurrent_uA);
+    }
+
+    drawRunDisplay(terminalVoltage, displayedCurrent_uA, showCurrent);
+    printRunDebug(
+      terminalVoltage,
+      measuredCurrent_uA,
+      correctedCurrent_uA,
+      filteredCurrent_uA,
+      showCurrent
+    );
+  }
+
+  // ----------------------------------------------------------
+  // COIL TEST mode
+  // ----------------------------------------------------------
+  else if (mode == MODE_COIL) {
+    currentDisplayValid = false;
+    clearCurrentFilter();
+    voltageMovementSuspected = false;
+
+    bool enableOn = coilEnableOn();
+
+    float coilVoltage = readCoilVoltage();
+    float coilResistance_ohms = calculateCoilResistance_ohms(coilVoltage);
+
+    drawCoilDisplay(coilVoltage, coilResistance_ohms, enableOn);
+    printCoilDebug(coilVoltage, coilResistance_ohms, enableOn);
+  }
+
+  // ----------------------------------------------------------
+  // STOP mode
+  // ----------------------------------------------------------
+  else {
+    currentDisplayValid = false;
+    clearCurrentFilter();
+    voltageMovementSuspected = false;
+    stableVoltageReference = 0.0;
+    lastVoltageMove_ms = millis();
+
+    drawStopDisplay(coilEnableOn());
+  }
+
+  delay(50);
+}
+
+// ============================================================
+// Mode input handling
+// ============================================================
+TesterMode readMode() {
+  bool coilSelected = digitalRead(PIN_COIL_DETECT) == LOW;
+  bool runSelected  = digitalRead(PIN_RUN_DETECT) == LOW;
+
+  if (runSelected && !coilSelected) {
+    return MODE_RUN;
+  }
+
+  if (coilSelected && !runSelected) {
+    return MODE_COIL;
+  }
+
+  // STOP if both HIGH, or invalid both LOW.
+  return MODE_STOP;
+}
+
+bool coilEnableOn() {
+  return digitalRead(PIN_COIL_ENABLE) == LOW;
+}
+
+// ============================================================
+// ADS reading
+// ============================================================
+float readSingleEndedVoltage(uint8_t channel, int samples) {
+  ads.readADC_SingleEnded(channel);
+  delay(5);
+
+  long sum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    sum += ads.readADC_SingleEnded(channel);
+    delay(1);
+  }
+
+  float voltage = (sum / (float)samples) * ADS_VOLTS_PER_COUNT;
+
+  if (voltage < 0.0) {
+    voltage = 0.0;
+  }
+
+  return voltage;
+}
+
+float readRunTerminalVoltage() {
+  return readSingleEndedVoltage(CH_SENSE_LO_RUN, 8);
+}
+
+float readCoilVoltage() {
+  return readSingleEndedVoltage(CH_COIL, 8);
+}
+
+float readCurrentBlock_uA() {
+  long sumHi = 0;
+  long sumLo = 0;
+
+  for (int i = 0; i < currentBlockSamples; i++) {
+    sumHi += ads.readADC_SingleEnded(CH_SENSE_HI);
+    sumLo += ads.readADC_SingleEnded(CH_SENSE_LO_RUN);
+    delay(1);
+  }
+
+  float vSenseHi =
+    (sumHi / (float)currentBlockSamples) * ADS_VOLTS_PER_COUNT;
+
+  float vSenseLo =
+    (sumLo / (float)currentBlockSamples) * ADS_VOLTS_PER_COUNT;
+
+  float current_uA =
+    ((vSenseHi - vSenseLo) / senseResistor_ohms) * 1000000.0;
+
+  if (current_uA > -zeroDeadband_uA && current_uA < zeroDeadband_uA) {
+    current_uA = 0.0;
+  }
+
+  if (current_uA < 0.0) {
+    current_uA = 0.0;
+  }
+
+  return current_uA;
+}
+
+// ============================================================
+// PHASE/RUN+ pulldown compensation
+// ============================================================
+float calculateOutputPulldownCurrent_uA(float terminalVoltage) {
+  if (terminalVoltage <= 0.0) {
+    return 0.0;
+  }
+
+  return (terminalVoltage / outputPulldown_ohms) * 1000000.0;
+}
+
+float applyOutputPulldownCorrection(
+  float measuredCurrent_uA,
+  float terminalVoltage
+) {
+  float correctedCurrent_uA =
+    measuredCurrent_uA - calculateOutputPulldownCurrent_uA(terminalVoltage);
+
+  if (correctedCurrent_uA < 0.0) {
+    correctedCurrent_uA = 0.0;
+  }
+
+  return correctedCurrent_uA;
+}
+
+// ============================================================
+// Coil resistance calculation
+// ============================================================
+float calculateCoilResistance_ohms(float coilVoltage) {
+  if (coilVoltage >= coilOpenVoltageThreshold_V) {
+    return -1.0;  // OPEN
+  }
+
+  if (coilVoltage <= 0.005) {
+    return 0.0;   // SHORT
+  }
+
+  float denominator = referenceVoltage_V - coilVoltage;
+
+  if (denominator <= 0.001) {
+    return -1.0;  // effectively open / invalid
+  }
+
+  // Raw measured load at COIL.
+  // This load is the external coil/resistor in parallel with R7 10M.
+  float measuredLoad_ohms =
+    coilKnownResistor_ohms * coilVoltage / denominator;
+
+  if (measuredLoad_ohms <= 0.0) {
+    return 0.0;
+  }
+
+  // Correct for R7 10M pulldown:
+  // 1/Rmeasured = 1/Rexternal + 1/Rpulldown
+  float inverseExternal =
+    (1.0 / measuredLoad_ohms) - (1.0 / coilPulldown_ohms);
+
+  if (inverseExternal <= 0.0) {
+    return -1.0;
+  }
+
+  return 1.0 / inverseExternal;
+}
+
+// ============================================================
+// Current filter functions
+// ============================================================
+void resetCurrentFilter(float seedCurrent_uA) {
+  for (int i = 0; i < currentBufferSize; i++) {
+    currentBuffer[i] = seedCurrent_uA;
+  }
+
+  currentBufferIndex = 0;
+  currentBufferCount = currentBufferSize;
+
+  filteredCurrent_uA = seedCurrent_uA;
+  displayedCurrent_uA = seedCurrent_uA;
+
+  jumpPersistenceCounter = 0;
+  pendingJumpCurrent_uA = seedCurrent_uA;
+
+  highCurrentCounter = 0;
+  highCurrentFlag = false;
+}
+
+void clearCurrentFilter() {
+  currentBufferIndex = 0;
+  currentBufferCount = 0;
+
+  filteredCurrent_uA = 0.0;
+  displayedCurrent_uA = 0.0;
+
+  jumpPersistenceCounter = 0;
+  pendingJumpCurrent_uA = 0.0;
+
+  highCurrentCounter = 0;
+  highCurrentFlag = false;
+}
+
+float averageCurrentBuffer() {
+  if (currentBufferCount == 0) {
+    return 0.0;
+  }
+
+  float sum = 0.0;
+
+  for (int i = 0; i < currentBufferCount; i++) {
+    sum += currentBuffer[i];
+  }
+
+  return sum / (float)currentBufferCount;
+}
+
+float processCurrentForDisplay(float rawCurrent_uA) {
+  float currentAverage = averageCurrentBuffer();
+  float difference = fabs(rawCurrent_uA - currentAverage);
+
+  if (currentBufferCount >= currentBufferSize &&
+      difference > currentJumpThreshold_uA) {
+
+    if (jumpPersistenceCounter == 0) {
+      pendingJumpCurrent_uA = rawCurrent_uA;
+      jumpPersistenceCounter = 1;
+      return currentAverage;
+    }
+
+    if (fabs(rawCurrent_uA - pendingJumpCurrent_uA) <= currentJumpThreshold_uA) {
+      jumpPersistenceCounter++;
+    } else {
+      pendingJumpCurrent_uA = rawCurrent_uA;
+      jumpPersistenceCounter = 1;
+    }
+
+    if (jumpPersistenceCounter < requiredJumpPersistence) {
+      return currentAverage;
+    }
+
+    resetCurrentFilter(rawCurrent_uA);
+    return rawCurrent_uA;
+  }
+
+  jumpPersistenceCounter = 0;
+
+  currentBuffer[currentBufferIndex] = rawCurrent_uA;
+  currentBufferIndex = (currentBufferIndex + 1) % currentBufferSize;
+
+  if (currentBufferCount < currentBufferSize) {
+    currentBufferCount++;
+  }
+
+  return averageCurrentBuffer();
+}
+
+void updateHighCurrentFlag(float rawCurrent_uA) {
+  if (rawCurrent_uA >= highCurrentThreshold_uA) {
+    highCurrentCounter++;
+  } else {
+    highCurrentCounter = 0;
+    highCurrentFlag = false;
+  }
+
+  if (highCurrentCounter >= highCurrentPersistenceBlocks) {
+    highCurrentFlag = true;
+  }
+}
+
+// ============================================================
+// Display functions
+// ============================================================
+void drawBootScreen() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.print(F("ACCUTRON"));
+
+  display.setCursor(0, 18);
+  display.print(F("TEST SET"));
+
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.print(F("Rev B PCB"));
+
+  display.setCursor(0, 54);
+  display.print(F("A0 PHASE  A3 COIL"));
+
+  display.display();
+}
+
+void drawRunDisplay(float terminalVoltage, float current_uA, bool showCurrent) {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // Smaller centered PHASING title.
+  display.setTextSize(1);
+  display.setCursor(43, 0);
+  display.print(F("PHASING"));
+
+  bool showHighWarning =
+    showCurrent &&
+    highCurrentFlag &&
+    ((millis() / 1500) % 2 == 1);
+
+  if (showHighWarning) {
+    display.setTextSize(2);
+    display.setCursor(40, 22);
+    display.print(F("HIGH"));
+
+    display.setCursor(22, 42);
+    display.print(F("CURRENT"));
+  } else {
+    // Voltage line.
+    // Size 3 numerals improve readability; size 2 unit keeps labels smaller.
+    display.setTextSize(3);
+    display.setCursor(10, 13);
+
+    if (terminalVoltage < 10.0) {
+      display.print(F(" "));
+    }
+
+    display.print(terminalVoltage, 2);
+
+    display.setTextSize(2);
+    display.setCursor(104, 19);
+    display.print(F("V"));
+
+    // Current line.
+    // Same numeral cursor and leading space keep decimals aligned with voltage.
+    display.setTextSize(3);
+    display.setCursor(10, 38);
+
+    if (showCurrent) {
+      if (current_uA < 10.0) {
+        display.print(F(" "));
+      }
+
+      display.print(current_uA, 2);
+    } else {
+      display.print(F(" -.--"));
+    }
+
+    display.setTextSize(2);
+    display.setCursor(104, 44);
+    display.print(F("uA"));
+  }
+
+  display.display();
+}
+
+void drawStopDisplay(bool coilEnableIsOn) {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  if (coilEnableIsOn) {
+    display.setTextSize(2);
+    display.setCursor(16, 14);
+    display.print(F("Turn Off"));
+
+    display.setTextSize(2);
+    display.setCursor(4, 38);
+    display.print(F("CoilSwitch"));
+  } else {
+    display.setTextSize(3);
+    display.setCursor(1, 12);
+    display.print(F("Outputs"));
+
+    display.setTextSize(3);
+    display.setCursor(37, 40);
+    display.print(F("Off"));
+  }
+
+  display.display();
+}
+
+void drawCoilEnableWarningDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // Split title so PHASING LOCK can be larger and still fit.
+  display.setTextSize(2);
+  display.setCursor(22, 0);
+  display.print(F("PHASING"));
+
+  display.setTextSize(2);
+  display.setCursor(40, 16);
+  display.print(F("LOCK"));
+
+  display.setTextSize(2);
+  display.setCursor(22, 34);
+  display.print(F("COIL ON"));
+
+  display.setTextSize(1);
+  display.setCursor(7, 56);
+  display.print(F("Turn off coil switch"));
+
+  display.display();
+}
+
+void drawCoilDisplay(
+  float coilVoltage,
+  float coilResistance_ohms,
+  bool enableOn
+) {
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // Centered title.
+  display.setTextSize(2);
+  display.setCursor(10, 0);
+  display.print(F("COIL TEST"));
+
+  if (!enableOn) {
+    display.setTextSize(2);
+    display.setCursor(22, 22);
+    display.print(F("TURN ON"));
+
+    display.setTextSize(1);
+    display.setCursor(4, 54);
+    display.print(F("Use COIL TEST switch"));
+
+    display.display();
+    return;
+  }
+
+  if (coilResistance_ohms < 0.0) {
+    display.setTextSize(3);
+    display.setCursor(28, 24);
+    display.print(F("OPEN"));
+  }
+
+  else if (coilResistance_ohms <= coilShortThreshold_ohms) {
+    display.setTextSize(2);
+    display.setCursor(34, 28);
+    display.print(F("SHORT"));
+  }
+
+  else if (coilResistance_ohms > coilHighDisplayLimit_ohms) {
+    display.setTextSize(2);
+    display.setCursor(40, 28);
+    display.print(F(">50k"));
+  }
+
+  else if (coilResistance_ohms >= 1000.0) {
+    display.setTextSize(3);
+
+    float kOhms = coilResistance_ohms / 1000.0;
+
+    if (kOhms < 10.0) {
+      display.setCursor(19, 24);
+      display.print(kOhms, 2);
+      display.print(F("k"));
+    } else {
+      display.setCursor(19, 24);
+      display.print(kOhms, 1);
+      display.print(F("k"));
+    }
+  }
+
+  else {
+    display.setTextSize(3);
+
+    // Keep sub-1k readings anchored with the k-ohm readings.
+    // This prevents the value from jumping left when crossing below 1000 ohm.
+    display.setCursor(19, 24);
+    display.print(coilResistance_ohms, 0);
+
+    display.setTextSize(1);
+    display.setCursor(96, 44);
+    display.print(F("ohm"));
+  }
+
+  // A3 footer centered at bottom.
+  display.setTextSize(1);
+  display.setCursor(37, 56);
+  display.print(F("A3 "));
+  display.print(coilVoltage, 2);
+  display.print(F(" V"));
+
+  display.display();
+}
+
+// ============================================================
+// Serial debug
+// ============================================================
+void printRunDebug(
+  float terminalVoltage,
+  float measuredCurrent_uA,
+  float correctedCurrent_uA,
+  float filteredCurrent_uA,
+  bool showCurrent
+) {
+  static unsigned long lastPrint_ms = 0;
+
+  if (millis() - lastPrint_ms < 500) {
+    return;
+  }
+
+  lastPrint_ms = millis();
+
+  Serial.print(F("RUN  A0/PHASE="));
+  Serial.print(terminalVoltage, 4);
+
+  Serial.print(F("V  Iraw="));
+  Serial.print(measuredCurrent_uA, 3);
+
+  Serial.print(F("uA  Icorr="));
+  Serial.print(correctedCurrent_uA, 3);
+
+  Serial.print(F("uA  Ifilt="));
+  Serial.print(filteredCurrent_uA, 3);
+
+  Serial.print(F("uA  show="));
+  Serial.println(showCurrent ? F("Y") : F("N"));
+}
+
+void printCoilDebug(
+  float coilVoltage,
+  float coilResistance_ohms,
+  bool enableOn
+) {
+  static unsigned long lastPrint_ms = 0;
+
+  if (millis() - lastPrint_ms < 500) {
+    return;
+  }
+
+  lastPrint_ms = millis();
+
+  Serial.print(F("COIL  enable="));
+  Serial.print(enableOn ? F("ON") : F("OFF"));
+
+  Serial.print(F("  A3="));
+  Serial.print(coilVoltage, 4);
+
+  Serial.print(F("V  R="));
+
+  if (!enableOn) {
+    Serial.println(F("ENABLE_OFF"));
+  } else if (coilResistance_ohms < 0.0) {
+    Serial.println(F("OPEN"));
+  } else {
+    Serial.print(coilResistance_ohms, 1);
+    Serial.println(F(" ohms"));
+  }
+}
