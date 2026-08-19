@@ -10,7 +10,7 @@ Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_ADS1115 ads;
 
 // ============================================================
-// Rev B PCB ADS1115 channel map
+// MK II ADS1115 channel map
 // ============================================================
 // A0 = RUN terminal sense / SENSE_LO through R3 4.7k from PHASE/J1
 // A1 = SENSE_HI, high side of R2 current sense resistor
@@ -50,7 +50,8 @@ enum TesterMode {
 
 const float senseResistor_ohms = 1000.0;       // R2
 const float coilKnownResistor_ohms = 47000.0;  // R5
-const float outputPulldown_ohms = 4700000.0;   // R6, PHASE/RUN+ to GND
+// Diagnostic value measured in-circuit on this MK II unit.
+const float outputPulldown_ohms = 4550000.0;   // R6, PHASE/RUN+ to GND
 const float coilPulldown_ohms = 10000000.0;    // R7, COIL+ to GND
 const float referenceVoltage_V = 2.500;        // LM4040 nominal reference
 
@@ -58,17 +59,26 @@ const float referenceVoltage_V = 2.500;        // LM4040 nominal reference
 // +/-4.096V full scale = 0.125mV/count
 const float ADS_VOLTS_PER_COUNT = 0.000125;
 
+// ADS1115 GAIN_SIXTEEN differential scale:
+// +/-0.256V full scale = 7.8125uV/count.
+// Across R2 1k, one count represents 0.0078125uA.
+const float ADS_DIFF_VOLTS_PER_COUNT = 0.0000078125;
+
 // ============================================================
 // Current filtering / display behavior
 // ============================================================
-const int currentBlockSamples = 8;
-const int currentBufferSize = 10;
+// Use a longer paired-sample block to average the pulsed current waveform.
+// This restores the sampling depth used by the stable MK I firmware.
+const int currentBlockSamples = 32;
+// Restore the known-stable MK I display response now that differential
+// acquisition has removed the underlying A0/A1 subtraction noise.
+const int currentBufferSize = 8;
 
 float currentBuffer[currentBufferSize];
 int currentBufferIndex = 0;
 int currentBufferCount = 0;
 
-const float currentDisplaySmoothing = 0.08;
+const float currentDisplaySmoothing = 0.12;
 float displayedCurrent_uA = 0.0;
 float filteredCurrent_uA = 0.0;
 
@@ -85,11 +95,16 @@ int highCurrentCounter = 0;
 bool highCurrentFlag = false;
 
 // Voltage/current reacquisition behavior
-const float voltageMoveThreshold = 0.015;
-const unsigned long currentReacquire_ms = 350;
+// Do not interpret ordinary loaded-output variation as movement of the
+// voltage-adjustment control. A change must exceed 25 mV for three
+// consecutive measurement cycles before the current filter is cleared.
+const float voltageMoveThreshold = 0.025;
+const int voltageMoveConfirmCount = 3;
+const unsigned long currentReacquire_ms = 500;
 const float outputOffThreshold_V = 0.10;
 
 float stableVoltageReference = 0.0;
+int voltageMoveCounter = 0;
 bool voltageMovementSuspected = false;
 unsigned long lastVoltageMove_ms = 0;
 bool currentDisplayValid = false;
@@ -166,7 +181,7 @@ void setup() {
 
   drawBootScreen();
 
-  Serial.println(F("Accutron Tester Rev B PCB"));
+  Serial.println(F("Accutron Tester MK II"));
   Serial.println(F("ADS A0 = PHASE terminal / SENSE_LO"));
   Serial.println(F("ADS A1 = SENSE_HI"));
   Serial.println(F("ADS A2 = unused"));
@@ -201,6 +216,7 @@ void loop() {
       currentDisplayValid = false;
       clearCurrentFilter();
       voltageMovementSuspected = false;
+      voltageMoveCounter = 0;
       stableVoltageReference = 0.0;
       lastVoltageMove_ms = millis();
 
@@ -225,18 +241,28 @@ void loop() {
       currentDisplayValid = false;
       clearCurrentFilter();
       stableVoltageReference = terminalVoltage;
+      voltageMoveCounter = 0;
       voltageMovementSuspected = false;
     } else {
       float voltageChangeFromStable = fabs(terminalVoltage - stableVoltageReference);
 
       if (voltageChangeFromStable > voltageMoveThreshold) {
-        voltageMovementSuspected = true;
-        lastVoltageMove_ms = millis();
-        currentDisplayValid = false;
-        clearCurrentFilter();
-        stableVoltageReference = terminalVoltage;
+        voltageMoveCounter++;
+
+        if (voltageMoveCounter >= voltageMoveConfirmCount) {
+          voltageMovementSuspected = true;
+          lastVoltageMove_ms = millis();
+          currentDisplayValid = false;
+          clearCurrentFilter();
+          stableVoltageReference = terminalVoltage;
+          voltageMoveCounter = 0;
+          Serial.println(F("CURRENT FILTER RESET: confirmed voltage adjustment"));
+        } else {
+          voltageMovementSuspected = false;
+        }
       } else {
         voltageMovementSuspected = false;
+        voltageMoveCounter = 0;
         stableVoltageReference =
           (stableVoltageReference * 0.95) + (terminalVoltage * 0.05);
       }
@@ -290,6 +316,7 @@ void loop() {
     currentDisplayValid = false;
     clearCurrentFilter();
     voltageMovementSuspected = false;
+    voltageMoveCounter = 0;
 
     bool enableOn = coilEnableOn();
 
@@ -307,6 +334,7 @@ void loop() {
     currentDisplayValid = false;
     clearCurrentFilter();
     voltageMovementSuspected = false;
+    voltageMoveCounter = 0;
     stableVoltageReference = 0.0;
     lastVoltageMove_ms = millis();
 
@@ -343,6 +371,9 @@ bool coilEnableOn() {
 // ADS reading
 // ============================================================
 float readSingleEndedVoltage(uint8_t channel, int samples) {
+  // PHASE and COIL voltage measurements require the +/-4.096V range.
+  ads.setGain(GAIN_ONE);
+
   ads.readADC_SingleEnded(channel);
   delay(5);
 
@@ -371,28 +402,38 @@ float readCoilVoltage() {
 }
 
 float readCurrentBlock_uA() {
-  long sumHi = 0;
-  long sumLo = 0;
+  // Measure the small voltage across R2 directly instead of subtracting
+  // two separate ~1.55V single-ended channel readings.
+  ads.setGain(GAIN_SIXTEEN);
+
+  // A0 is SENSE_LO and A1 is SENSE_HI, so the ADS library returns
+  // A0 - A1 as a negative number during normal forward current flow.
+  // Discard one conversion after changing gain/mux to allow settling.
+  ads.readADC_Differential_0_1();
+  delay(5);
+
+  long differentialSum = 0;
 
   for (int i = 0; i < currentBlockSamples; i++) {
-    sumHi += ads.readADC_SingleEnded(CH_SENSE_HI);
-    sumLo += ads.readADC_SingleEnded(CH_SENSE_LO_RUN);
+    differentialSum += ads.readADC_Differential_0_1();
     delay(1);
   }
 
-  float vSenseHi =
-    (sumHi / (float)currentBlockSamples) * ADS_VOLTS_PER_COUNT;
+  float averageCounts =
+    differentialSum / (float)currentBlockSamples;
 
-  float vSenseLo =
-    (sumLo / (float)currentBlockSamples) * ADS_VOLTS_PER_COUNT;
+  float senseVoltage_V =
+    -averageCounts * ADS_DIFF_VOLTS_PER_COUNT;
 
   float current_uA =
-    ((vSenseHi - vSenseLo) / senseResistor_ohms) * 1000000.0;
+    (senseVoltage_V / senseResistor_ohms) * 1000000.0;
 
-  if (current_uA > -zeroDeadband_uA && current_uA < zeroDeadband_uA) {
-    current_uA = 0.0;
-  }
+  // Restore the normal voltage-measurement range for subsequent reads.
+  ads.setGain(GAIN_ONE);
 
+  // Do not apply the normal display deadband here. This diagnostic build
+  // must preserve the expected ~0.34uA R6 current so serial output can show
+  // whether the pulldown actually passes through R2.
   if (current_uA < 0.0) {
     current_uA = 0.0;
   }
@@ -582,7 +623,7 @@ void drawBootScreen() {
 
   display.setTextSize(1);
   display.setCursor(0, 42);
-  display.print(F("Rev B PCB"));
+  display.print(F("MK II"));
 
   display.setCursor(0, 54);
   display.print(F("A0 PHASE  A3 COIL"));
@@ -633,17 +674,23 @@ void drawRunDisplay(float terminalVoltage, float current_uA, bool showCurrent) {
     display.setCursor(10, 38);
 
     if (showCurrent) {
-      if (current_uA < 10.0) {
+      // Round first, then make the alignment decision from the exact value
+      // that will be printed. Without this, an internal value such as 9.96
+      // is treated as a one-digit number but prints as 10.0, adding an extra
+      // leading space and briefly shifting into the uA label.
+      float roundedCurrent_uA = round(current_uA * 10.0) / 10.0;
+
+      if (roundedCurrent_uA < 10.0) {
         display.print(F(" "));
       }
 
-      display.print(current_uA, 2);
+      display.print(roundedCurrent_uA, 1);
     } else {
-      display.print(F(" -.--"));
+      display.print(F(" -.-"));
     }
 
     display.setTextSize(2);
-    display.setCursor(104, 44);
+    display.setCursor(88, 44);
     display.print(F("uA"));
   }
 
@@ -803,10 +850,13 @@ void printRunDebug(
   Serial.print(F("RUN  A0/PHASE="));
   Serial.print(terminalVoltage, 4);
 
-  Serial.print(F("V  Iraw="));
+  Serial.print(F("V  Idiff_raw="));
   Serial.print(measuredCurrent_uA, 3);
 
-  Serial.print(F("uA  Icorr="));
+  Serial.print(F("uA  Ipull="));
+  Serial.print(calculateOutputPulldownCurrent_uA(terminalVoltage), 3);
+
+  Serial.print(F("uA  Idiff_corr="));
   Serial.print(correctedCurrent_uA, 3);
 
   Serial.print(F("uA  Ifilt="));
